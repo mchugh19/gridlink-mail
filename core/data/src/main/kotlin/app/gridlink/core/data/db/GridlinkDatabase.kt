@@ -11,8 +11,9 @@ import androidx.room.RoomDatabase
         ScheduledSendEntity::class, SnoozedEntity::class, RecentContactEntity::class, OutboxEntity::class,
         PurgeSnapshotEntity::class, MailboxUidValidityEntity::class,
         DavCollectionEntity::class, CalendarEventEntity::class, AddressBookContactEntity::class,
+        CalendarTaskEntity::class,
     ],
-    version = 27,
+    version = 28,
     exportSchema = false,
 )
 abstract class GridlinkDatabase : RoomDatabase() {
@@ -29,6 +30,7 @@ abstract class GridlinkDatabase : RoomDatabase() {
     abstract fun davCollectionDao(): DavCollectionDao
     abstract fun calendarEventDao(): CalendarEventDao
     abstract fun addressBookContactDao(): AddressBookContactDao
+    abstract fun calendarTaskDao(): CalendarTaskDao
 
     companion object {
         fun build(context: Context): GridlinkDatabase =
@@ -51,7 +53,8 @@ abstract class GridlinkDatabase : RoomDatabase() {
                 // opening of the body and not just subject and sender; 22→23 adds the per-folder
                 // IMAP sync point (HIGHESTMODSEQ/UIDNEXT/EXISTS) that lets a refresh skip a
                 // folder nothing has happened in (RFC 7162); 23→24 adds the custom keywords
-                // (tags) a message carries, packed so the tag filter can narrow in SQL.
+                // (tags) a message carries, packed so the tag filter can narrow in SQL;
+                // 27→28 adds `calendar_tasks`, the VTODO mirror beside `calendar_events`.
                 .addMigrations(
                     MIGRATION_9_10, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                     MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
@@ -59,6 +62,7 @@ abstract class GridlinkDatabase : RoomDatabase() {
                     MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25,
                     MIGRATION_25_26,
                     MIGRATION_26_27,
+                    MIGRATION_27_28,
                 )
                 // The rest of the DB is a disposable mirror of the server: if some other schema
                 // change has no migration, rebuilding the cache is an acceptable fallback.

@@ -7,6 +7,7 @@ import app.gridlink.core.data.contacts.JsContact
 import app.gridlink.core.data.contacts.VCard
 import app.gridlink.core.data.db.AddressBookContactEntity
 import app.gridlink.core.data.db.CalendarEventEntity
+import app.gridlink.core.data.db.CalendarTaskEntity
 import app.gridlink.core.data.db.DavCollectionEntity
 import app.gridlink.core.dav.DavCollection
 import app.gridlink.core.dav.DavItem
@@ -148,6 +149,53 @@ internal object DavMappers {
                 recurrenceId = event.recurrenceId?.toString(),
                 startDay = startDate.toEpochDay(),
                 endDay = endDate?.toEpochDay()?.takeIf { it > startDate.toEpochDay() },
+                raw = item.data.orEmpty(),
+            )
+        }
+    }
+
+    /**
+     * Every task in one `.ics`.
+     *
+     * [events]' counterpart: a file can hold VTODOs beside its VEVENTs (and usually holds only
+     * one kind), so a calendar sync maps both and the repository files each under its own table.
+     * Same key rule as events: the master keeps the bare href, a detached override gets
+     * `href#recurrence-id`.
+     *
+     * The stored due is DUE when the file carries one and DTSTART when it does not, because a
+     * reader asking "when is this due" should not have to know which of the two the server
+     * chose to write; [CalendarTaskEntity.startLocal] keeps DTSTART itself for the recurrence.
+     */
+    fun tasks(
+        accountId: String,
+        collectionUrl: String,
+        item: DavItem,
+        fallbackZone: ZoneId,
+    ): List<CalendarTaskEntity> {
+        val parsed = ICalendarStream.parseTasks(item.data, fallbackZone)
+        return parsed.map { task ->
+            val due = task.due ?: task.start
+            CalendarTaskEntity(
+                accountId = accountId,
+                href = if (task.recurrenceId == null) item.href else "${item.href}#${task.recurrenceId}",
+                collectionUrl = collectionUrl,
+                etag = item.etag,
+                uid = task.uid,
+                summary = task.summary,
+                description = task.description,
+                location = task.location,
+                dueLocal = due?.toString(),
+                startLocal = task.start?.toString(),
+                zoneId = task.zone.id,
+                allDay = task.allDay,
+                status = task.status,
+                completedLocal = task.completedAt?.toString(),
+                percentComplete = task.percentComplete,
+                priority = task.priority,
+                rrule = task.rrule,
+                exDates = task.exDates.joinToString(",") { it.toString() },
+                recurrenceId = task.recurrenceId?.toString(),
+                dueDay = due?.toLocalDate()?.toEpochDay(),
                 raw = item.data.orEmpty(),
             )
         }

@@ -169,6 +169,39 @@ interface CalendarEventDao {
 }
 
 @Dao
+interface CalendarTaskDao {
+
+    /** Every cached task for an account. Task counts are small; no range query earns its keep here. */
+    @Query("SELECT * FROM calendar_tasks WHERE accountId = :accountId")
+    fun observeAll(accountId: String): Flow<List<CalendarTaskEntity>>
+
+    /** Href and etag of everything cached for one collection, without the bodies. */
+    @Query("SELECT href, etag FROM calendar_tasks WHERE accountId = :accountId AND collectionUrl = :collectionUrl")
+    suspend fun etagsForCollection(accountId: String, collectionUrl: String): List<DavStoredEtag>
+
+    @Upsert
+    suspend fun upsertAll(tasks: List<CalendarTaskEntity>)
+
+    /** Every row one `.ics` produced, master and `href#recurrence-id` overrides alike. */
+    @Query(
+        "DELETE FROM calendar_tasks WHERE accountId = :accountId " +
+            "AND (href = :href OR href LIKE :prefix || '%' ESCAPE '\\')",
+    )
+    suspend fun deleteForFile(accountId: String, href: String, prefix: String)
+
+    /** Clear ONE calendar's tasks, for a resync the server told us to start over. */
+    @Query("DELETE FROM calendar_tasks WHERE accountId = :accountId AND collectionUrl = :collectionUrl")
+    suspend fun deleteForCollection(accountId: String, collectionUrl: String)
+
+    /** Drop tasks belonging to calendars that are no longer on the server. */
+    @Query("DELETE FROM calendar_tasks WHERE accountId = :accountId AND collectionUrl NOT IN (:keepUrls)")
+    suspend fun deleteNotInCollections(accountId: String, keepUrls: List<String>)
+
+    @Query("DELETE FROM calendar_tasks WHERE accountId = :accountId")
+    suspend fun deleteForAccount(accountId: String)
+}
+
+@Dao
 interface AddressBookContactDao {
 
     /**

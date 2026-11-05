@@ -10,6 +10,8 @@ import app.gridlink.core.data.calendar.EventField
 import app.gridlink.core.data.calendar.ICalendar
 import app.gridlink.core.data.calendar.ICalendarStream
 import app.gridlink.core.data.calendar.JsCalendarWrite
+import app.gridlink.core.data.calendar.ParsedCalendarTask
+import app.gridlink.core.data.calendar.Recurrence
 import app.gridlink.core.data.contacts.ContactEdit
 import app.gridlink.core.data.contacts.ContactPayload
 import app.gridlink.core.data.contacts.VCardWrite
@@ -17,6 +19,8 @@ import app.gridlink.core.data.db.AddressBookContactDao
 import app.gridlink.core.data.db.AddressBookContactEntity
 import app.gridlink.core.data.db.CalendarEventDao
 import app.gridlink.core.data.db.CalendarEventEntity
+import app.gridlink.core.data.db.CalendarTaskDao
+import app.gridlink.core.data.db.CalendarTaskEntity
 import app.gridlink.core.data.db.DavCollectionDao
 import app.gridlink.core.data.db.DavCollectionEntity
 import app.gridlink.core.data.net.DavSrv
@@ -64,6 +68,36 @@ data class DavSyncOutcome(
         fun skipped() = DavSyncOutcome(collections = 0, itemsChanged = 0, itemsRemoved = 0)
     }
 }
+
+/**
+ * One task as the screens show it: a master VTODO reduced to the instance that currently
+ * matters, with its due already converted into the device's zone.
+ *
+ * A repeating task appears once, at its next uncompleted instance (or its latest missed one,
+ * flagged [overdue], when nothing is left ahead). A task with no due at all is a someday item:
+ * [dueDate] and [dueTime] are both null and it sorts after everything dated.
+ */
+data class DavTask(
+    /** The row's key: the server file, plus `#recurrence-id` for a detached instance. */
+    val href: String,
+    val uid: String,
+    val summary: String?,
+    val description: String?,
+    val location: String?,
+    /** The day this instance is due, in the device zone; null for a someday task. */
+    val dueDate: LocalDate?,
+    /** When it is due that day, in the device zone; null for an all-day or someday task. */
+    val dueTime: LocalTime?,
+    val allDay: Boolean,
+    /** STATUS verbatim, upper case. Completed and cancelled tasks are never handed out. */
+    val status: String,
+    val priority: Int?,
+    val percentComplete: Int?,
+    /** Whether the task repeats, so a screen can say so without re-reading the rule. */
+    val repeating: Boolean,
+    /** Due before today and not done: the instance shown is a missed one. */
+    val overdue: Boolean,
+)
 
 /**
  * What one write attempt did.
@@ -131,6 +165,7 @@ class DavRepository(
     private val collectionDao: DavCollectionDao,
     private val eventDao: CalendarEventDao,
     private val contactDao: AddressBookContactDao,
+    private val taskDao: CalendarTaskDao,
     /** The device's zone, injected so the whole class is testable without touching the clock. */
     private val zone: () -> ZoneId = { ZoneId.systemDefault() },
     /** JMAP client for the contacts capability; null (tests, or a pure-DAV build) means DAV only. */
@@ -185,6 +220,122 @@ class DavRepository(
 
     fun observeContacts(accountId: String): Flow<List<AddressBookContactEntity>> =
         contactDao.observeAll(accountId)
+
+    /** Every open task for the account, reduced to its current instance. See [DavTask]. */
+    fun observeTasks(accountId: String): Flow<List<DavTask>> =
+        taskDao.observeAll(accountId).map { rows -> taskInstances(rows, LocalDate.now(zone())) }
+
+    /**
+     * Reduce cached task rows to the instances worth showing, split out so it can be tested
+     * without a database, as [occurrencesOf] is for events.
+     *
+     * Masters drive. A repeating master expands over its rule; its detached overrides both
+     * replace their instance (an open one is shown from the override row, at its own due) and
+     * suppress it (a completed or cancelled one leaves nothing behind). An override whose
+     * master is not in the cache stands alone rather than vanishing. Completed and cancelled
+     * masters are dropped whole.
+     */
+    internal fun taskInstances(rows: List<CalendarTaskEntity>, today: LocalDate): List<DavTask> {
+        val displayZone = zone()
+        val overrides = rows.filter { it.recurrenceId != null }
+        val out = ArrayList<DavTask>()
+
+        for (master in rows.filter { it.recurrenceId == null }) {
+            if (master.status == ParsedCalendarTask.STATUS_COMPLETED ||
+                master.status == ParsedCalendarTask.STATUS_CANCELLED
+            ) {
+                continue
+            }
+            val replaced = overrides.filter { it.uid == master.uid }
+                .mapNotNull { it.recurrenceDate() }.toSet()
+            val anchor = master.anchorDateTime()
+            val date: LocalDate? = when {
+                master.rrule != null && anchor != null -> {
+                    val window = anchor.toLocalDate()..maxOf(today, anchor.toLocalDate())
+                        .plusDays(TASK_HORIZON_DAYS)
+                    val days = Recurrence.expand(
+                        Recurrence.parse(master.rrule),
+                        anchor.toLocalDate(),
+                        window,
+                        master.exDateSet() + replaced,
+                    )
+                    // The next instance still ahead, or the latest missed one when the series
+                    // has run out: both are "the instance that matters now".
+                    days.firstOrNull { it >= today } ?: days.lastOrNull()
+                }
+                else -> master.dueDateTime()?.toLocalDate()
+            }
+            out += master.toDavTask(date, today, displayZone, repeating = master.rrule != null)
+        }
+
+        for (override in overrides) {
+            // A completed or cancelled override has already done its work above, by suppressing
+            // the master's instance for its day. Only an open one has anything to show.
+            if (override.status == ParsedCalendarTask.STATUS_COMPLETED ||
+                override.status == ParsedCalendarTask.STATUS_CANCELLED
+            ) {
+                continue
+            }
+            out += override.toDavTask(
+                override.dueDateTime()?.toLocalDate(),
+                today,
+                displayZone,
+                repeating = true,
+            )
+        }
+
+        return out.sortedWith(
+            compareBy<DavTask> { it.dueDate == null }
+                .thenBy { it.dueDate }
+                .thenBy { it.dueTime ?: LocalTime.MIN }
+                .thenBy { it.summary.orEmpty() },
+        )
+    }
+
+    /** This row as a [DavTask] sitting on [date], with its time converted into [displayZone]. */
+    private fun CalendarTaskEntity.toDavTask(
+        date: LocalDate?,
+        today: LocalDate,
+        displayZone: ZoneId,
+        repeating: Boolean,
+    ): DavTask {
+        val wall = (dueDateTime() ?: anchorDateTime())?.toLocalTime()
+        val zoned = if (date != null && !allDay && wall != null) {
+            LocalDateTime.of(date, wall).atZone(zoneOr(displayZone)).withZoneSameInstant(displayZone)
+        } else {
+            null
+        }
+        return DavTask(
+            href = href,
+            uid = uid,
+            summary = summary,
+            description = description,
+            location = location,
+            dueDate = zoned?.toLocalDate() ?: date,
+            dueTime = zoned?.toLocalTime(),
+            allDay = allDay,
+            status = status,
+            priority = priority,
+            percentComplete = percentComplete,
+            repeating = repeating,
+            overdue = date != null && date < today,
+        )
+    }
+
+    private fun CalendarTaskEntity.dueDateTime(): LocalDateTime? =
+        dueLocal?.let { runCatching { LocalDateTime.parse(it) }.getOrNull() }
+
+    private fun CalendarTaskEntity.anchorDateTime(): LocalDateTime? =
+        (startLocal ?: dueLocal)?.let { runCatching { LocalDateTime.parse(it) }.getOrNull() }
+
+    private fun CalendarTaskEntity.zoneOr(fallback: ZoneId): ZoneId =
+        runCatching { ZoneId.of(zoneId) }.getOrNull() ?: fallback
+
+    private fun CalendarTaskEntity.exDateSet(): Set<LocalDate> =
+        exDates.split(',').mapNotNull { runCatching { LocalDate.parse(it.trim()) }.getOrNull() }.toSet()
+
+    private fun CalendarTaskEntity.recurrenceDate(): LocalDate? =
+        recurrenceId?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
 
     fun observeEventCount(accountId: String): Flow<Int> = eventDao.observeCount(accountId)
 
@@ -1641,6 +1792,7 @@ class DavRepository(
     suspend fun clearAccount(accountId: String) {
         eventDao.deleteForAccount(accountId)
         contactDao.deleteForAccount(accountId)
+        taskDao.deleteForAccount(accountId)
         collectionDao.deleteForAccount(accountId)
     }
 
@@ -1759,7 +1911,10 @@ class DavRepository(
             clearItems(accountId, kindKey)
         } else {
             when (kind) {
-                DavKind.CALENDAR -> eventDao.deleteNotInCollections(accountId, keep)
+                DavKind.CALENDAR -> {
+                    eventDao.deleteNotInCollections(accountId, keep)
+                    taskDao.deleteNotInCollections(accountId, keep)
+                }
                 DavKind.ADDRESS_BOOK -> contactDao.deleteNotInCollections(accountId, keep)
             }
         }
@@ -1776,7 +1931,11 @@ class DavRepository(
             // DAV items: rows synced over JMAP share these tables under synthetic hrefs, and one
             // of those in the map would read as an item the DAV server deleted.
             val knownEtags = when (kind) {
-                DavKind.CALENDAR -> eventDao.etagsForCollection(accountId, collection.url)
+                // Events and tasks share a calendar's files (one .ics can hold both), so the
+                // diff has to know the etags of both tables or every task-only file would be
+                // fetched again on every sync and its tasks re-parsed forever.
+                DavKind.CALENDAR -> eventDao.etagsForCollection(accountId, collection.url) +
+                    taskDao.etagsForCollection(accountId, collection.url)
                 DavKind.ADDRESS_BOOK -> contactDao.etagsForCollection(accountId, collection.url)
             }.filter { it.href.startsWith("/") }.associate { it.href to it.etag }
             val result = try {
@@ -1794,7 +1953,10 @@ class DavRepository(
             // the only way to notice a deletion that happened while the app was not syncing.
             if (result.fullResync) {
                 when (kind) {
-                    DavKind.CALENDAR -> eventDao.deleteForCollection(accountId, collection.url)
+                    DavKind.CALENDAR -> {
+                        eventDao.deleteForCollection(accountId, collection.url)
+                        taskDao.deleteForCollection(accountId, collection.url)
+                    }
                     DavKind.ADDRESS_BOOK -> contactDao.deleteForCollection(accountId, collection.url)
                 }
             }
@@ -1813,7 +1975,12 @@ class DavRepository(
                         // rows first is what keeps the deleted override from surviving forever.
                         eventDao.deleteForFile(accountId, item.href, prefix)
                         eventDao.upsertAll(rows)
-                        changed += rows.size
+                        // The same file's VTODOs, under the same rule: a file edited from a
+                        // task into an event (or back) must not leave the old kind behind.
+                        val taskRows = DavMappers.tasks(accountId, collection.url, item, zone())
+                        taskDao.deleteForFile(accountId, item.href, prefix)
+                        taskDao.upsertAll(taskRows)
+                        changed += rows.size + taskRows.size
                     }
                     DavKind.ADDRESS_BOOK -> {
                         val rows = DavMappers.contacts(accountId, collection.url, item)
@@ -1827,7 +1994,10 @@ class DavRepository(
             for (href in result.removed) {
                 val prefix = DavMappers.hrefPrefix(href)
                 when (kind) {
-                    DavKind.CALENDAR -> eventDao.deleteForFile(accountId, href, prefix)
+                    DavKind.CALENDAR -> {
+                        eventDao.deleteForFile(accountId, href, prefix)
+                        taskDao.deleteForFile(accountId, href, prefix)
+                    }
                     DavKind.ADDRESS_BOOK -> contactDao.deleteForFile(accountId, href, prefix)
                 }
                 removed++
@@ -1849,7 +2019,10 @@ class DavRepository(
 
     private suspend fun clearItems(accountId: String, kindKey: String) {
         when (kindKey) {
-            DavCollectionEntity.KIND_CALENDAR -> eventDao.deleteForAccount(accountId)
+            DavCollectionEntity.KIND_CALENDAR -> {
+                eventDao.deleteForAccount(accountId)
+                taskDao.deleteForAccount(accountId)
+            }
             DavCollectionEntity.KIND_CONTACTS -> contactDao.deleteForAccount(accountId)
         }
     }
@@ -1879,6 +2052,9 @@ private const val DELETE_CHUNK = 400
 
 /** Rows per slice when observeOccurrences loads the events behind its identity list. */
 private const val EVENT_LOAD_SLICE = 200
+
+/** How far past today a repeating task is expanded to find its next instance. */
+private const val TASK_HORIZON_DAYS = 370L
 
 /** No longer than a filename can sensibly be; the UID becomes `"$uid.ics"` on the server. */
 private const val MAX_UID_LENGTH = 255

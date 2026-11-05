@@ -659,3 +659,48 @@ const val CONTACT_REMOTE_ID_SQL: String =
  */
 const val COLLECTION_REMOTE_ID_SQL: String =
     "ALTER TABLE `dav_collections` ADD COLUMN `remoteId` TEXT"
+
+/** The `calendar_tasks` table ([CalendarTaskEntity]); shared with the JVM test. */
+const val CALENDAR_TASKS_CREATE_SQL: String =
+    "CREATE TABLE IF NOT EXISTS `calendar_tasks` (" +
+        "`accountId` TEXT NOT NULL, " +
+        "`href` TEXT NOT NULL, " +
+        "`collectionUrl` TEXT NOT NULL, " +
+        "`etag` TEXT, " +
+        "`uid` TEXT NOT NULL, " +
+        "`summary` TEXT, " +
+        "`description` TEXT, " +
+        "`location` TEXT, " +
+        "`dueLocal` TEXT, " +
+        "`startLocal` TEXT, " +
+        "`zoneId` TEXT NOT NULL, " +
+        "`allDay` INTEGER NOT NULL, " +
+        "`status` TEXT NOT NULL, " +
+        "`completedLocal` TEXT, " +
+        "`percentComplete` INTEGER, " +
+        "`priority` INTEGER, " +
+        "`rrule` TEXT, " +
+        "`exDates` TEXT NOT NULL, " +
+        "`recurrenceId` TEXT, " +
+        "`dueDay` INTEGER, " +
+        "`raw` TEXT NOT NULL, " +
+        "PRIMARY KEY(`accountId`, `href`))"
+
+/** The index behind the task due-day lookups. */
+const val CALENDAR_TASKS_INDEX_SQL: String =
+    "CREATE INDEX IF NOT EXISTS `index_calendar_tasks_accountId_dueDay` " +
+        "ON `calendar_tasks` (`accountId`, `dueDay`)"
+
+/**
+ * Additive 27→28: `calendar_tasks`, the VTODO mirror.
+ *
+ * One new table, nothing existing touched. It starts empty, which is the correct state: tasks
+ * arrive with the next DAV sync, and a migration rather than the destructive fallback for the
+ * usual reason, that the fallback would take the outbox with it.
+ */
+val MIGRATION_27_28 = object : Migration(27, 28) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(CALENDAR_TASKS_CREATE_SQL)
+        db.execSQL(CALENDAR_TASKS_INDEX_SQL)
+    }
+}
