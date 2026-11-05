@@ -27,6 +27,7 @@ import app.gridlink.ui.gridlink.GridlinkContactWriter
 import app.gridlink.ui.gridlink.GridlinkDavMapping
 import app.gridlink.ui.gridlink.GridlinkEvent
 import app.gridlink.ui.gridlink.GridlinkEventEditScope
+import app.gridlink.ui.gridlink.GridlinkTask
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -38,6 +39,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -145,11 +147,21 @@ class GridlinkDavViewModel(application: Application) : AndroidViewModel(applicat
         }
         .onEach { calendarPrimed.value = true }
 
+    /** The account's open to-dos, already reduced to their current instances by the repository. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val tasks: Flow<List<GridlinkTask>> = accountId
+        .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else repo.observeTasks(id) }
+        .map { rows -> rows.map(GridlinkDavMapping::task) }
+
+    private val eventsAndTasks: Flow<Pair<List<CalendarOccurrence>, List<GridlinkTask>>> =
+        combine(occurrences, tasks) { list, taskList -> list to taskList }
+
     /** The Calendar tab, as [app.gridlink.ui.gridlink.GridlinkRoot] takes it. */
     val calendar: StateFlow<GridlinkCalendarContent> =
-        combine(occurrences, calendarPrimed, anchor, ownDomain, calendarError) { list, ready, today, domain, error ->
+        combine(eventsAndTasks, calendarPrimed, anchor, ownDomain, calendarError) { (list, taskList), ready, today, domain, error ->
             GridlinkCalendarContent(
                 events = list.map { GridlinkDavMapping.event(it, domain) },
+                tasks = taskList,
                 today = today,
                 loading = !ready,
                 window = today.minusDays(WINDOW_BACK_DAYS)..today.plusDays(WINDOW_FORWARD_DAYS),

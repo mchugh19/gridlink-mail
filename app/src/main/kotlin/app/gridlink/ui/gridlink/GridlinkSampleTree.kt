@@ -536,3 +536,27 @@ data class GridlinkEvent(
 ) {
     val allDay: Boolean get() = start == null
 }
+
+/**
+ * One to-do entry for the calendar's day list.
+ *
+ * A VTODO reduced to the instance that currently matters (see the DAV layer's DavTask): a
+ * repeating task appears once, at its next due day. Read-only for now: no handle and no
+ * completion action, because writing STATUS back for one instance of a recurring task is its
+ * own piece of work. The row is something to read, not to tap.
+ */
+data class GridlinkTask(
+    val id: String,
+    val title: String,
+    /** The day this instance is due; null for a someday task, which no day list shows. */
+    val date: LocalDate?,
+    /** Due time that day; null means all-day. */
+    val start: LocalTime? = null,
+    val location: String? = null,
+    /** Free text (iCalendar DESCRIPTION). Null and blank both mean "no notes". */
+    val notes: String? = null,
+    /** Due before today and not done. Shown under today as well as under its own day. */
+    val overdue: Boolean = false,
+    /** Whether the task repeats, so the row can say so. */
+    val repeating: Boolean = false,
+)

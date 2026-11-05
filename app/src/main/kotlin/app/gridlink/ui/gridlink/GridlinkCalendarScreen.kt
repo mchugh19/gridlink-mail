@@ -960,6 +960,10 @@ private fun GridlinkMonthDayList(
 ) {
     val colors = GridlinkTheme.colors
     val mode = GridlinkTheme.mode
+    val book = LocalGridlinkBook.current
+    // The day's to-dos, plus every overdue one when the day is today: a missed chore is today's
+    // problem, and a list that only shows it under a day last week is a list that hides it.
+    val dayTasks = book.tasks.filter { it.date == date || (it.overdue && date == book.today) }
     Column(modifier) {
         Text(
             text = date.format(AGENDA_DAY),
@@ -975,7 +979,7 @@ private fun GridlinkMonthDayList(
             ),
         )
 
-        if (events.isEmpty()) {
+        if (events.isEmpty() && dayTasks.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1010,7 +1014,76 @@ private fun GridlinkMonthDayList(
                         current = events[index].id == currentId,
                     )
                 }
+                if (dayTasks.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "Tasks",
+                            style = GridlinkType.sectionLabel,
+                            color = colors.textSecondary,
+                            maxLines = 1,
+                            modifier = Modifier.padding(
+                                start = GridlinkSpacing.rowHorizontal,
+                                end = GridlinkSpacing.rowHorizontal,
+                                top = GridlinkSpacing.s12,
+                                bottom = GridlinkSpacing.s4,
+                            ),
+                        )
+                    }
+                    items(dayTasks.size, key = { "task:" + dayTasks[it].id }) { index ->
+                        GridlinkTaskRow(dayTasks[index])
+                    }
+                }
             }
+        }
+    }
+}
+
+/**
+ * One to-do in the day list: an empty box, the title, and when it is due.
+ *
+ * Deliberately not a [GridlinkAgendaRow]: a task is not an appointment, it has no span to draw
+ * and nothing to open yet, and dressing it as one would promise an editor this pass does not
+ * have. The box is a glyph rather than a control for the same reason: it says what the thing
+ * is, and tapping it does nothing, because completing a task is a server write that has not
+ * been built.
+ */
+@Composable
+private fun GridlinkTaskRow(task: GridlinkTask) {
+    val colors = GridlinkTheme.colors
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                horizontal = GridlinkSpacing.rowHorizontal,
+                vertical = GridlinkSpacing.s8,
+            ),
+    ) {
+        Text(
+            text = "☐",
+            style = GridlinkType.subject,
+            color = colors.textSecondary,
+        )
+        Column(Modifier.padding(start = GridlinkSpacing.s12)) {
+            Text(
+                text = task.title,
+                style = GridlinkType.subject,
+                color = colors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val meta = buildString {
+                append(task.start?.compact() ?: "All day")
+                if (task.overdue) append(" · Overdue")
+                if (task.repeating) append(" · Repeats")
+                task.location?.let { append(" · ").append(it) }
+            }
+            Text(
+                text = meta,
+                style = GridlinkType.metadata,
+                color = if (task.overdue) colors.accent else colors.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

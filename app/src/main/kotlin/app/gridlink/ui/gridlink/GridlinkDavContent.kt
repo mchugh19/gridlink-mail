@@ -54,6 +54,13 @@ data class GridlinkCalendarContent(
      * describes the state of the calendar, and a failure is a state.
      */
     val error: String? = null,
+    /**
+     * The account's open to-dos, each reduced to its current instance. Not windowed like
+     * [events]: a task list is short, and an overdue task from before [window] is exactly the
+     * one that must not fall off the edge of it. Last, with a default, so existing positional
+     * constructions of this class keep meaning what they meant.
+     */
+    val tasks: List<GridlinkTask> = emptyList(),
 ) {
     /** Whether [events] can be trusted to be complete for [date]. */
     fun covers(date: LocalDate): Boolean = window?.contains(date) ?: true

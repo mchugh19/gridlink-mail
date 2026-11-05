@@ -102,6 +102,13 @@ class GridlinkBook(
             }
 
     /**
+     * The account's open to-dos. Live only: the sample calendar invents appointments for
+     * previews, but an invented chore list would read as the user's own obligations, so the
+     * fallback is empty rather than fictional.
+     */
+    val tasks: List<GridlinkTask> = calendar?.tasks ?: emptyList()
+
+    /**
      * The address book with this run's additions folded in, in phonebook order.
      *
      * Re-sorted rather than appended, so somebody added as "Arlen Voss" lands under V between the

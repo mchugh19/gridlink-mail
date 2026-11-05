@@ -4,6 +4,7 @@ import app.gridlink.core.data.calendar.CalendarAttachmentSource
 import app.gridlink.core.data.calendar.CalendarOccurrence
 import app.gridlink.core.data.contacts.ContactEdit
 import app.gridlink.core.data.contacts.ContactPayload
+import app.gridlink.core.data.dav.DavTask
 import app.gridlink.core.data.db.AddressBookContactEntity
 import app.gridlink.ui.gridlink.GridlinkSampleContacts.GridlinkContact
 import java.time.LocalDate
@@ -212,6 +213,18 @@ object GridlinkDavMapping {
      * the row's format calls for, so a JMAP-synced card is read here exactly as the save path
      * reads it.
      */
+    /** One open task as a day-list entry. The id is the row's href, unique per instance. */
+    fun task(task: DavTask): GridlinkTask = GridlinkTask(
+        id = PREFIX + task.href,
+        title = task.summary?.takeIf { it.isNotBlank() } ?: "Untitled task",
+        date = task.dueDate,
+        start = task.dueTime,
+        location = task.location?.takeIf { it.isNotBlank() },
+        notes = task.description?.takeIf { it.isNotBlank() },
+        overdue = task.overdue,
+        repeating = task.repeating,
+    )
+
     fun contact(row: AddressBookContactEntity): GridlinkContact {
         val parsed = ContactPayload.parse(row)
         val family = when {
