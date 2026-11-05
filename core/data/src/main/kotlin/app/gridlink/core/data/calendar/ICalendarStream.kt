@@ -64,6 +64,66 @@ data class ParsedCalendarEvent(
 }
 
 /**
+ * One VTODO from a CalDAV collection: a to-do, as opposed to an appointment.
+ *
+ * Tasks live in the same collections and the same `.ics` files as events, and until this reader
+ * existed the sync downloaded them and the event parser silently dropped them, so a weekly
+ * "put the bins out" reminder on the server simply never appeared anywhere in the app.
+ *
+ * The shape mirrors [ParsedCalendarEvent] where the two agree (zone kept, recurrence kept as
+ * text) and differs where a task genuinely differs: the anchor is a DUE rather than a start/end
+ * span, and completion is state the event model has no equivalent of.
+ */
+data class ParsedCalendarTask(
+    val uid: String,
+    val summary: String?,
+    val description: String? = null,
+    val location: String? = null,
+    /**
+     * Local wall-clock due in [zone]; midnight on the day for a date-only DUE. Null when the
+     * task carries neither DUE nor DTSTART (a someday item, which sorts last rather than never).
+     */
+    val due: LocalDateTime?,
+    /** DTSTART when the file carries one: the recurrence anchor, and what a DURATION counts from. */
+    val start: LocalDateTime?,
+    val zone: ZoneId,
+    /** The DUE (or DTSTART) was a plain date, so the task is due that day, not at a time. */
+    val allDay: Boolean,
+    /** STATUS verbatim, upper case; [STATUS_NEEDS_ACTION] when the file does not say. */
+    val status: String,
+    /** When the task was marked done, in [zone]; only meaningful when [status] is COMPLETED. */
+    val completedAt: LocalDateTime?,
+    val percentComplete: Int?,
+    /** RFC 5545 PRIORITY, 0 (undefined) to 9 (lowest); null when absent. */
+    val priority: Int?,
+    val rrule: String?,
+    val exDates: List<LocalDate>,
+    /** Set only on a detached override: the date of the instance this VTODO replaces. */
+    val recurrenceId: LocalDate?,
+    /** Reminder offsets in minutes before the due time, from the VALARMs' relative TRIGGERs. */
+    val reminders: List<Int> = emptyList(),
+    /** The server file this task came out of, when the caller knows it. See [ParsedCalendarEvent.href]. */
+    val href: String? = null,
+) {
+    /**
+     * The moment the recurrence runs from. RFC 5545 defines a VTODO's recurrence set off its
+     * DTSTART; a task that carries only a DUE recurs from that instead, which is the shape most
+     * servers actually write for a repeating reminder.
+     */
+    val anchor: LocalDateTime? get() = start ?: due
+
+    val completed: Boolean get() = status == STATUS_COMPLETED
+    val cancelled: Boolean get() = status == STATUS_CANCELLED
+
+    companion object {
+        const val STATUS_NEEDS_ACTION = "NEEDS-ACTION"
+        const val STATUS_IN_PROCESS = "IN-PROCESS"
+        const val STATUS_COMPLETED = "COMPLETED"
+        const val STATUS_CANCELLED = "CANCELLED"
+    }
+}
+
+/**
  * One event on one day, already converted into the zone the calendar is being **viewed** in.
  *
  * [start] is null for an all-day event, which is the same signal [app.gridlink.core.data.calendar]
@@ -175,6 +235,51 @@ object ICalendarStream {
                     // reminder offset. Only VALARM puts a TRIGGER at this depth, and only a relative
                     // "before the start" one reads as a reminder; the rest return null and are
                     // dropped rather than misfiled.
+                    current != null && depth == 1 && line.name == "TRIGGER" ->
+                        triggerMinutes(line)?.let { alarms?.add(it) }
+                }
+            }
+            out
+        } catch (t: Throwable) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Parse every VTODO in [raw].
+     *
+     * The [parse] loop's twin, kept separate rather than generalised: the two components share
+     * a transport shape and almost nothing else, and a merged loop would make the event path,
+     * which everything else in the app stands on, carry a second component's state machine for
+     * no benefit. Like [parse] it is total: bad input loses a task, never throws.
+     */
+    fun parseTasks(raw: String?, fallbackZone: ZoneId): List<ParsedCalendarTask> {
+        if (raw.isNullOrBlank()) return emptyList()
+        if (raw.length > MAX_SOURCE_CHARS) return emptyList()
+        return try {
+            val lines = ContentLines.parseAll(raw)
+            val zones = embeddedZones(lines)
+            val out = ArrayList<ParsedCalendarTask>()
+
+            var depth = 0
+            var current: MutableList<ContentLine>? = null
+            var alarms: MutableList<Int>? = null
+            for (line in lines) {
+                val component = line.value.trim().uppercase()
+                when {
+                    line.name == "BEGIN" && component == "VTODO" -> {
+                        current = ArrayList(); alarms = ArrayList(); depth = 0
+                    }
+                    line.name == "END" && component == "VTODO" -> {
+                        current?.let { buildTask(it, alarms.orEmpty(), zones, fallbackZone)?.let(out::add) }
+                        current = null
+                        alarms = null
+                    }
+                    // A VALARM sits inside the VTODO with its own lines, exactly as in a VEVENT:
+                    // its DESCRIPTION is not the task's, and its TRIGGER is a reminder, kept below.
+                    line.name == "BEGIN" && current != null -> depth++
+                    line.name == "END" && current != null -> depth--
+                    current != null && depth == 0 -> current.add(line)
                     current != null && depth == 1 && line.name == "TRIGGER" ->
                         triggerMinutes(line)?.let { alarms?.add(it) }
                 }
@@ -356,6 +461,67 @@ object ICalendarStream {
             category = first("CATEGORIES")?.value
                 ?.let { ContentLines.splitStructured(it, ',').firstOrNull() }
                 ?.let(::text),
+            reminders = reminders.distinct().sorted(),
+        )
+    }
+
+    // ---- Building one task --------------------------------------------------------------------
+
+    private fun buildTask(
+        lines: List<ContentLine>,
+        reminders: List<Int>,
+        zones: Map<String, ZoneId>,
+        fallbackZone: ZoneId,
+    ): ParsedCalendarTask? {
+        fun first(name: String) = lines.firstOrNull { it.name == name }
+
+        // DUE is the task's own anchor and drives the zone; DTSTART is consulted when there is
+        // no DUE, mirroring how build() lets DTSTART drive an event. A task with neither is
+        // still a task (a someday item), so unlike an event it is not dropped for lacking one.
+        val dueLine = first("DUE")
+        val startLine = first("DTSTART")
+        val zone = when {
+            dueLine != null -> resolveZone(dueLine.param("TZID"), zones, fallbackZone)
+            startLine != null -> resolveZone(startLine.param("TZID"), zones, fallbackZone)
+            else -> fallbackZone
+        }
+        val start = startLine?.let { parseDateTime(it, resolveZone(it.param("TZID"), zones, zone)) }
+        val due = when {
+            dueLine != null -> parseDateTime(dueLine, zone)
+            start != null -> first("DURATION")?.let { duration(it.value) }?.let { start.value.plus(it) }
+                ?.let { Dated(it, start.dateOnly) }
+            else -> null
+        }
+        // Both anchors unreadable means the dates the file does carry are corrupt; a task whose
+        // only date cannot be read is dropped rather than shown due on a guessed day.
+        if ((dueLine != null || startLine != null) && due == null && start == null) return null
+
+        val status = first("STATUS")?.value?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+            ?: ParsedCalendarTask.STATUS_NEEDS_ACTION
+
+        return ParsedCalendarTask(
+            uid = first("UID")?.value?.trim().orEmpty(),
+            summary = text(first("SUMMARY")?.value),
+            description = text(first("DESCRIPTION")?.value),
+            location = text(first("LOCATION")?.value),
+            due = due?.value,
+            start = start?.value,
+            zone = zone,
+            allDay = (due ?: start)?.dateOnly == true,
+            status = status,
+            // COMPLETED is a UTC stamp by the RFC; parseDateTime moves a Z time into the zone.
+            completedAt = first("COMPLETED")?.let { parseDateTime(it, zone) }?.value,
+            percentComplete = first("PERCENT-COMPLETE")?.value?.trim()?.toIntOrNull()?.coerceIn(0, 100),
+            priority = first("PRIORITY")?.value?.trim()?.toIntOrNull()?.coerceIn(0, 9),
+            rrule = first("RRULE")?.value?.trim()?.takeIf { it.isNotEmpty() },
+            exDates = lines.filter { it.name == "EXDATE" }
+                .flatMap { line ->
+                    ContentLines.splitUnquoted(line.value, ',')
+                        .mapNotNull { parseDateTime(line, zone, it)?.value?.toLocalDate() }
+                },
+            recurrenceId = first("RECURRENCE-ID")
+                ?.let { parseDateTime(it, resolveZone(it.param("TZID"), zones, zone)) }
+                ?.value?.toLocalDate(),
             reminders = reminders.distinct().sorted(),
         )
     }
